@@ -1,0 +1,22 @@
+{
+  "name": "@asdsadw12312dwd2112xz/openapi-gen-cli",
+  "version": "1.0.0",
+  "description": "CLI tool for generating and managing OpenAPI 3.0 specifications",
+  "type": "module",
+  "bin": {
+    "openapi-gen": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch"
+  },
+  "dependencies": {
+    "chalk": "^5.3.0",
+    "commander": "^12.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.2",
+    "tsup": "^8.3.5",
+    "typescript": "^5.7.3"
+  }
+}
