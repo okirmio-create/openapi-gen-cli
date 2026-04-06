@@ -1,14 +1,17 @@
 {
   "name": "@asdsadw12312dwd2112xz/openapi-gen-cli",
   "version": "1.0.0",
-  "description": "CLI tool for generating and managing OpenAPI 3.0 specifications",
+  "description": "Generate TypeScript clients, server stubs, and types from OpenAPI specs",
   "type": "module",
   "bin": {
     "openapi-gen": "./dist/index.js"
   },
+  "files": [
+    "dist"
+  ],
   "scripts": {
-    "build": "tsup",
-    "dev": "tsup --watch"
+    "build": "node node_modules/tsup/dist/cli-default.js",
+    "dev": "node node_modules/tsup/dist/cli-default.js --watch"
   },
   "dependencies": {
     "chalk": "^5.3.0",

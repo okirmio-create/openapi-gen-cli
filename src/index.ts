@@ -1,473 +1,974 @@
 import { Command } from "commander";
 import chalk from "chalk";
-import { existsSync, readFileSync, writeFileSync } from "fs";
-import { resolve } from "path";
+import { existsSync, readFileSync, writeFileSync, mkdirSync } from "fs";
+import { resolve, dirname, basename, extname } from "path";
 
-// ─── Types ───────────────────────────────────────────────────────────────────
+// ─── Types ────────────────────────────────────────────────────────────────────
 
-interface OpenAPIInfo {
-  title: string;
-  version: string;
-  description?: string;
-}
-
-interface OpenAPIServer {
-  url: string;
-  description?: string;
-}
-
-interface OpenAPISchema {
+interface SchemaObject {
   type?: string;
-  properties?: Record<string, OpenAPISchemaProperty>;
-  required?: string[];
-  allOf?: OpenAPISchemaRef[];
-  oneOf?: OpenAPISchemaRef[];
-  anyOf?: OpenAPISchemaRef[];
-  description?: string;
-}
-
-interface OpenAPISchemaProperty {
-  type: string;
-  description?: string;
   format?: string;
-  example?: unknown;
+  description?: string;
+  properties?: Record<string, SchemaObject>;
+  additionalProperties?: SchemaObject | boolean;
+  items?: SchemaObject;
+  required?: string[];
+  allOf?: (SchemaObject | RefObject)[];
+  oneOf?: (SchemaObject | RefObject)[];
+  anyOf?: (SchemaObject | RefObject)[];
+  nullable?: boolean;
+  enum?: unknown[];
+  $ref?: string;
 }
 
-interface OpenAPISchemaRef {
+interface RefObject {
   $ref: string;
 }
 
-interface OpenAPIComponents {
-  schemas: Record<string, OpenAPISchema>;
+interface MediaTypeObject {
+  schema?: SchemaObject | RefObject;
 }
 
-interface OpenAPIParameter {
+interface RequestBodyObject {
+  required?: boolean;
+  content: Record<string, MediaTypeObject>;
+}
+
+interface ResponseObject {
+  description: string;
+  content?: Record<string, MediaTypeObject>;
+}
+
+interface ParameterObject {
   name: string;
   in: "query" | "path" | "header" | "cookie";
   required?: boolean;
-  schema: { type: string };
+  schema?: SchemaObject;
   description?: string;
 }
 
-interface OpenAPIRequestBody {
-  required: boolean;
-  content: {
-    "application/json": {
-      schema: OpenAPISchemaRef;
-    };
-  };
+interface OperationObject {
+  operationId?: string;
+  summary?: string;
+  tags?: string[];
+  parameters?: ParameterObject[];
+  requestBody?: RequestBodyObject;
+  responses: Record<string, ResponseObject>;
 }
 
-interface OpenAPIResponse {
-  description: string;
-  content?: {
-    "application/json": {
-      schema: OpenAPISchemaRef | OpenAPISchema;
-    };
-  };
-}
-
-interface OpenAPIOperation {
-  operationId: string;
-  tags: string[];
-  summary: string;
-  parameters?: OpenAPIParameter[];
-  requestBody?: OpenAPIRequestBody;
-  responses: Record<string, OpenAPIResponse>;
-}
-
-interface OpenAPIPath {
-  [method: string]: OpenAPIOperation;
+interface PathItemObject {
+  get?: OperationObject;
+  post?: OperationObject;
+  put?: OperationObject;
+  patch?: OperationObject;
+  delete?: OperationObject;
+  head?: OperationObject;
+  options?: OperationObject;
 }
 
 interface OpenAPISpec {
-  openapi: string;
-  info: OpenAPIInfo;
-  servers: OpenAPIServer[];
-  paths: Record<string, OpenAPIPath>;
-  components: OpenAPIComponents;
+  openapi?: string;
+  swagger?: string;
+  info: { title: string; version: string; description?: string };
+  servers?: { url: string; description?: string }[];
+  paths?: Record<string, PathItemObject>;
+  components?: {
+    schemas?: Record<string, SchemaObject | RefObject>;
+  };
+  definitions?: Record<string, SchemaObject | RefObject>;
 }
 
-// ─── YAML serializer (no deps) ───────────────────────────────────────────────
+// ─── Spec loader ──────────────────────────────────────────────────────────────
 
-function toYaml(value: unknown, indent = 0): string {
-  const pad = "  ".repeat(indent);
-
-  if (value === null || value === undefined) return "null";
-
-  if (typeof value === "boolean") return value ? "true" : "false";
-
-  if (typeof value === "number") return String(value);
-
-  if (typeof value === "string") {
-    // Multi-line strings
-    if (value.includes("\n")) {
-      const lines = value.split("\n");
-      return "|\n" + lines.map((l) => pad + "  " + l).join("\n");
-    }
-    // Strings that need quoting
-    if (
-      /[:{}\[\],&*#?|<>=!%@`]/.test(value) ||
-      value.startsWith(" ") ||
-      value.endsWith(" ") ||
-      value === "" ||
-      /^(true|false|null|yes|no|on|off|\d+\.?\d*)$/i.test(value)
-    ) {
-      return `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
-    }
-    return value;
-  }
-
-  if (Array.isArray(value)) {
-    if (value.length === 0) return "[]";
-    return value
-      .map((item) => {
-        if (typeof item === "object" && item !== null && !Array.isArray(item)) {
-          // Render at indent=0, then re-indent relative to current position.
-          const rendered = toYaml(item, 0);
-          const lines = rendered.split("\n");
-          const first = `${pad}- ${lines[0]}`;
-          const rest = lines.slice(1).map((l) => `${pad}  ${l}`);
-          return rest.length > 0 ? `${first}\n${rest.join("\n")}` : first;
-        }
-        return `${pad}- ${toYaml(item, 0)}`;
-      })
-      .join("\n");
-  }
-
-  if (typeof value === "object") {
-    const obj = value as Record<string, unknown>;
-    const keys = Object.keys(obj);
-    if (keys.length === 0) return "{}";
-    return keys
-      .map((key) => {
-        const v = obj[key];
-        const safeKey =
-          /[:{}\[\],&*#?|<>=!%@`\s]/.test(key) ? `"${key}"` : key;
-        if (
-          typeof v === "object" &&
-          v !== null &&
-          !Array.isArray(v) &&
-          Object.keys(v).length > 0
-        ) {
-          return `${pad}${safeKey}:\n${toYaml(v, indent + 1)}`;
-        }
-        if (Array.isArray(v) && v.length > 0) {
-          return `${pad}${safeKey}:\n${toYaml(v, indent + 1)}`;
-        }
-        return `${pad}${safeKey}: ${toYaml(v, indent + 1)}`;
-      })
-      .join("\n");
-  }
-
-  return String(value);
-}
-
-// ─── File helpers ─────────────────────────────────────────────────────────────
-
-const DEFAULT_FILE = "openapi.yaml";
-
-function resolveFile(file: string): string {
-  return resolve(process.cwd(), file);
-}
-
-function readSpec(file: string): OpenAPISpec {
-  const path = resolveFile(file);
-  if (!existsSync(path)) {
-    console.error(chalk.red(`File not found: ${path}`));
-    console.error(chalk.yellow('Run `openapi-gen init` first.'));
+function loadSpec(specPath: string): OpenAPISpec {
+  const abs = resolve(process.cwd(), specPath);
+  if (!existsSync(abs)) {
+    console.error(chalk.red(`Spec file not found: ${abs}`));
     process.exit(1);
   }
-  try {
-    // Parse YAML manually (no deps) — we only need to re-read what we wrote,
-    // so we serialise/deserialise via JSON round-trip through our own writer.
-    // Since we own the format we use a simple re-parse via eval-safe JSON trick:
-    // Actually we'll keep the spec in memory by re-reading the raw YAML we wrote.
-    // For simplicity, store a JSON sidecar alongside the YAML.
-    const jsonPath = path.replace(/\.ya?ml$/, ".json");
-    if (!existsSync(jsonPath)) {
-      console.error(
-        chalk.red(
-          `JSON sidecar not found: ${jsonPath}. Was the spec created with this tool?`
-        )
-      );
+
+  const raw = readFileSync(abs, "utf8");
+  const ext = extname(abs).toLowerCase();
+
+  if (ext === ".json") {
+    try {
+      return JSON.parse(raw) as OpenAPISpec;
+    } catch (e) {
+      console.error(chalk.red(`Invalid JSON: ${(e as Error).message}`));
       process.exit(1);
     }
-    return JSON.parse(readFileSync(jsonPath, "utf8")) as OpenAPISpec;
+  }
+
+  // Minimal YAML parser for OpenAPI specs
+  try {
+    return parseYaml(raw) as OpenAPISpec;
   } catch (e) {
-    console.error(chalk.red(`Failed to read spec: ${(e as Error).message}`));
+    console.error(chalk.red(`Failed to parse YAML: ${(e as Error).message}`));
     process.exit(1);
   }
 }
 
-function writeSpec(spec: OpenAPISpec, file: string): void {
-  const yamlPath = resolveFile(file);
-  const jsonPath = yamlPath.replace(/\.ya?ml$/, ".json");
+function parseYaml(yaml: string): unknown {
+  // Strip comments, then convert to JSON-compatible structure
+  const lines = yaml.split("\n");
+  return parseYamlLines(lines, 0).value;
+}
 
-  const yaml = "# Generated by openapi-gen-cli\n" + toYaml(spec) + "\n";
-  writeFileSync(yamlPath, yaml, "utf8");
-  writeFileSync(jsonPath, JSON.stringify(spec, null, 2), "utf8");
+interface ParseResult {
+  value: unknown;
+  nextIndex: number;
+}
+
+function parseYamlLines(lines: string[], startIndex: number, baseIndent = 0): ParseResult {
+  const result: Record<string, unknown> = {};
+  let i = startIndex;
+
+  while (i < lines.length) {
+    const line = lines[i];
+    const stripped = line.replace(/#.*$/, "").trimEnd();
+    if (!stripped.trim()) { i++; continue; }
+
+    const currentIndent = stripped.length - stripped.trimStart().length;
+    if (currentIndent < baseIndent) break;
+    if (currentIndent > baseIndent) { i++; continue; }
+
+    const trimmed = stripped.trim();
+
+    // List item
+    if (trimmed.startsWith("- ")) {
+      // Fall back to array parsing
+      return parseYamlArray(lines, startIndex, baseIndent);
+    }
+
+    // Key: value
+    const colonIdx = trimmed.indexOf(":");
+    if (colonIdx === -1) { i++; continue; }
+
+    const key = trimmed.slice(0, colonIdx).trim();
+    const rest = trimmed.slice(colonIdx + 1).trim();
+
+    if (rest === "" || rest === "|" || rest === ">") {
+      // Value is on next lines
+      i++;
+      const nextLine = lines[i] ?? "";
+      const nextStripped = nextLine.replace(/#.*$/, "").trimEnd();
+      const nextIndent = nextStripped.length - nextStripped.trimStart().length;
+
+      if (nextIndent > currentIndent) {
+        const nextTrimmed = nextStripped.trim();
+        if (nextTrimmed.startsWith("- ")) {
+          const arrResult = parseYamlArray(lines, i, nextIndent);
+          result[key] = arrResult.value;
+          i = arrResult.nextIndex;
+        } else {
+          const objResult = parseYamlLines(lines, i, nextIndent);
+          result[key] = objResult.value;
+          i = objResult.nextIndex;
+        }
+      } else {
+        result[key] = null;
+      }
+    } else {
+      result[key] = parseScalar(rest);
+      i++;
+    }
+  }
+
+  return { value: result, nextIndex: i };
+}
+
+function parseYamlArray(lines: string[], startIndex: number, baseIndent: number): ParseResult {
+  const result: unknown[] = [];
+  let i = startIndex;
+
+  while (i < lines.length) {
+    const line = lines[i];
+    const stripped = line.replace(/#.*$/, "").trimEnd();
+    if (!stripped.trim()) { i++; continue; }
+
+    const currentIndent = stripped.length - stripped.trimStart().length;
+    if (currentIndent < baseIndent) break;
+
+    const trimmed = stripped.trim();
+    if (!trimmed.startsWith("- ")) break;
+
+    const itemContent = trimmed.slice(2).trim();
+    if (itemContent.includes(":") && !itemContent.startsWith("'") && !itemContent.startsWith('"')) {
+      // Inline object or key
+      const colonIdx = itemContent.indexOf(":");
+      const key = itemContent.slice(0, colonIdx).trim();
+      const val = itemContent.slice(colonIdx + 1).trim();
+
+      const obj: Record<string, unknown> = {};
+      if (val) {
+        obj[key] = parseScalar(val);
+      } else {
+        obj[key] = null;
+      }
+
+      // Check for more keys at higher indent
+      i++;
+      const subIndent = baseIndent + 2;
+      while (i < lines.length) {
+        const subLine = lines[i];
+        const subStripped = subLine.replace(/#.*$/, "").trimEnd();
+        if (!subStripped.trim()) { i++; continue; }
+        const subCurrentIndent = subStripped.length - subStripped.trimStart().length;
+        if (subCurrentIndent <= baseIndent) break;
+        const subTrimmed = subStripped.trim();
+        const subColon = subTrimmed.indexOf(":");
+        if (subColon === -1) { i++; continue; }
+        const subKey = subTrimmed.slice(0, subColon).trim();
+        const subRest = subTrimmed.slice(subColon + 1).trim();
+        if (subRest === "") {
+          // nested
+          i++;
+          const nextLine = lines[i] ?? "";
+          const nextStripped = nextLine.replace(/#.*$/, "").trimEnd();
+          const nextIndent = nextStripped.length - nextStripped.trimStart().length;
+          if (nextIndent > subCurrentIndent) {
+            const r = parseYamlLines(lines, i, nextIndent);
+            obj[subKey] = r.value;
+            i = r.nextIndex;
+          }
+        } else {
+          obj[subKey] = parseScalar(subRest);
+          i++;
+        }
+      }
+      result.push(obj);
+    } else {
+      result.push(parseScalar(itemContent));
+      i++;
+    }
+  }
+
+  return { value: result, nextIndex: i };
+}
+
+function parseScalar(s: string): unknown {
+  if (s === "true") return true;
+  if (s === "false") return false;
+  if (s === "null" || s === "~") return null;
+  if (/^-?\d+$/.test(s)) return parseInt(s, 10);
+  if (/^-?\d+\.\d+$/.test(s)) return parseFloat(s);
+  if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) {
+    return s.slice(1, -1);
+  }
+  return s;
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-function slugify(s: string): string {
-  return s.replace(/[^a-zA-Z0-9_]/g, "_").replace(/^_+|_+$/g, "");
+function getSchemas(spec: OpenAPISpec): Record<string, SchemaObject | RefObject> {
+  return spec.components?.schemas ?? spec.definitions ?? {};
 }
 
-function methodColor(method: string): string {
-  const m = method.toUpperCase();
-  const colors: Record<string, (s: string) => string> = {
-    GET: chalk.green,
-    POST: chalk.blue,
-    PUT: chalk.yellow,
-    PATCH: chalk.cyan,
-    DELETE: chalk.red,
-  };
-  return (colors[m] ?? chalk.white)(m);
+function resolveRef(ref: string, spec: OpenAPISpec): SchemaObject | null {
+  const parts = ref.replace(/^#\//, "").split("/");
+  let obj: unknown = spec;
+  for (const part of parts) {
+    if (typeof obj !== "object" || obj === null) return null;
+    obj = (obj as Record<string, unknown>)[part];
+  }
+  return obj as SchemaObject;
 }
 
-// ─── Commands ─────────────────────────────────────────────────────────────────
+function schemaToTs(
+  schema: SchemaObject | RefObject | undefined,
+  spec: OpenAPISpec,
+  indent = 0,
+  seen = new Set<string>()
+): string {
+  if (!schema) return "unknown";
 
-function cmdInit(options: { output: string; title: string; apiVersion: string; server: string }): void {
-  const path = resolveFile(options.output);
-  if (existsSync(path)) {
-    console.error(chalk.yellow(`File already exists: ${path}`));
-    console.error(chalk.yellow("Use --output to specify a different filename."));
-    process.exit(1);
+  if ("$ref" in schema) {
+    const name = schema.$ref.split("/").pop() ?? "unknown";
+    return name;
   }
 
-  const spec: OpenAPISpec = {
-    openapi: "3.0.3",
-    info: {
-      title: options.title,
-      version: options.apiVersion,
-      description: "API description",
-    },
-    servers: [
-      {
-        url: options.server,
-        description: "Default server",
-      },
-    ],
-    paths: {},
-    components: {
-      schemas: {},
-    },
-  };
+  const s = schema as SchemaObject;
+  const pad = "  ".repeat(indent);
 
-  writeSpec(spec, options.output);
-  console.log(chalk.green("✓") + ` Created ${chalk.bold(path)}`);
-  console.log(
-    chalk.dim(
-      `  openapi: 3.0.3 | title: ${options.title} | version: ${options.apiVersion}`
-    )
-  );
-}
-
-function cmdEndpoint(
-  method: string,
-  path: string,
-  options: {
-    output: string;
-    tag: string;
-    operationId?: string;
-    summary?: string;
-    param?: string[];
-    noBody: boolean;
-    bodySchema?: string;
-  }
-): void {
-  const m = method.toLowerCase();
-  const allowedMethods = ["get", "post", "put", "patch", "delete", "head", "options"];
-  if (!allowedMethods.includes(m)) {
-    console.error(chalk.red(`Invalid method: ${method}`));
-    console.error(chalk.dim(`Allowed: ${allowedMethods.join(", ")}`));
-    process.exit(1);
+  if (s.nullable) {
+    const inner = schemaToTs({ ...s, nullable: false } as SchemaObject, spec, indent, seen);
+    return `${inner} | null`;
   }
 
-  if (!path.startsWith("/")) {
-    console.error(chalk.red(`Path must start with "/": ${path}`));
-    process.exit(1);
+  if (s.oneOf || s.anyOf) {
+    const variants = (s.oneOf ?? s.anyOf)!;
+    return variants.map((v) => schemaToTs(v, spec, indent, seen)).join(" | ");
   }
 
-  const spec = readSpec(options.output);
-
-  if (!spec.paths[path]) {
-    spec.paths[path] = {};
+  if (s.allOf) {
+    return s.allOf.map((v) => schemaToTs(v, spec, indent, seen)).join(" & ");
   }
 
-  if (spec.paths[path][m]) {
-    console.error(
-      chalk.yellow(`Endpoint ${methodColor(m)} ${path} already exists — overwriting.`)
-    );
+  if (s.enum) {
+    return s.enum.map((v) => JSON.stringify(v)).join(" | ");
   }
 
-  // Derive operationId from method + path if not provided
-  const operationId =
-    options.operationId ??
-    slugify(`${m}_${path.replace(/\//g, "_").replace(/[{}]/g, "")}`);
-
-  // Extract path parameters from path template {param}
-  const pathParamNames = [...path.matchAll(/\{([^}]+)\}/g)].map((r) => r[1]);
-
-  const parameters: OpenAPIParameter[] = pathParamNames.map((name) => ({
-    name,
-    in: "path",
-    required: true,
-    schema: { type: "string" },
-    description: `${name} path parameter`,
-  }));
-
-  // Additional query params from --param name:type
-  for (const p of options.param ?? []) {
-    const [pName, pType = "string"] = p.split(":");
-    parameters.push({
-      name: pName,
-      in: "query",
-      required: false,
-      schema: { type: pType },
-      description: `${pName} query parameter`,
-    });
-  }
-
-  const hasBody = !options.noBody && ["post", "put", "patch"].includes(m);
-
-  const operation: OpenAPIOperation = {
-    operationId,
-    tags: [options.tag],
-    summary: options.summary ?? `${method.toUpperCase()} ${path}`,
-    ...(parameters.length > 0 ? { parameters } : {}),
-    ...(hasBody
-      ? {
-          requestBody: {
-            required: true,
-            content: {
-              "application/json": {
-                schema: options.bodySchema
-                  ? { $ref: `#/components/schemas/${options.bodySchema}` }
-                  : { $ref: "#/components/schemas/RequestBody" },
-              },
-            },
-          },
-        }
-      : {}),
-    responses: {
-      "200": {
-        description: "Successful response",
-        content: {
-          "application/json": {
-            schema: { $ref: "#/components/schemas/Response" },
-          },
-        },
-      },
-      "400": {
-        description: "Bad request",
-      },
-      "401": {
-        description: "Unauthorized",
-      },
-      "500": {
-        description: "Internal server error",
-      },
-    },
-  };
-
-  spec.paths[path][m] = operation;
-
-  writeSpec(spec, options.output);
-
-  console.log(
-    chalk.green("✓") +
-      ` Added ${methodColor(m)} ${chalk.bold(path)} → operationId: ${chalk.cyan(operationId)}`
-  );
-  if (parameters.length > 0) {
-    console.log(chalk.dim(`  parameters: ${parameters.map((p) => p.name).join(", ")}`));
-  }
-  if (hasBody) {
-    console.log(chalk.dim(`  requestBody: application/json`));
+  switch (s.type) {
+    case "string":
+      return s.format === "date" || s.format === "date-time" ? "string" : "string";
+    case "integer":
+    case "number":
+      return "number";
+    case "boolean":
+      return "boolean";
+    case "null":
+      return "null";
+    case "array":
+      return `Array<${schemaToTs(s.items, spec, indent, seen)}>`;
+    case "object": {
+      if (s.additionalProperties && typeof s.additionalProperties !== "boolean") {
+        return `Record<string, ${schemaToTs(s.additionalProperties, spec, indent + 1, seen)}>`;
+      }
+      if (!s.properties || Object.keys(s.properties).length === 0) {
+        return "Record<string, unknown>";
+      }
+      const required = new Set(s.required ?? []);
+      const fields = Object.entries(s.properties)
+        .map(([key, val]) => {
+          const opt = required.has(key) ? "" : "?";
+          const desc = (val as SchemaObject).description;
+          const comment = desc ? `\n${pad}  /** ${desc} */\n${pad}  ` : `\n${pad}  `;
+          return `${comment}${key}${opt}: ${schemaToTs(val, spec, indent + 1, seen)};`;
+        })
+        .join("");
+      return `{${fields}\n${pad}}`;
+    }
+    default:
+      return "unknown";
   }
 }
 
-function cmdComponent(
-  name: string,
-  options: {
-    output: string;
-    type: string;
-    property?: string[];
-    required?: string[];
-    allOf?: string[];
-    oneOf?: string[];
-    anyOf?: string[];
-    description?: string;
+function toPascalCase(s: string): string {
+  return s.replace(/[-_/{}](.)/g, (_, c: string) => c.toUpperCase()).replace(/^(.)/, (_, c: string) => c.toUpperCase());
+}
+
+function toCamelCase(s: string): string {
+  const pascal = toPascalCase(s);
+  return pascal.charAt(0).toLowerCase() + pascal.slice(1);
+}
+
+function writeOutput(content: string, outPath: string): void {
+  const dir = dirname(outPath);
+  if (dir !== "." && !existsSync(dir)) {
+    mkdirSync(dir, { recursive: true });
   }
-): void {
-  const spec = readSpec(options.output);
+  writeFileSync(outPath, content, "utf8");
+  console.log(chalk.green("✓") + ` Written to ${chalk.bold(outPath)}`);
+}
 
-  if (spec.components.schemas[name]) {
-    console.error(chalk.yellow(`Component "${name}" already exists — overwriting.`));
-  }
+// ─── Command: types ───────────────────────────────────────────────────────────
 
-  const properties: Record<string, OpenAPISchemaProperty> = {};
+function cmdTypes(specPath: string, options: { output?: string; prefix?: string }): void {
+  const spec = loadSpec(specPath);
+  const schemas = getSchemas(spec);
+  const prefix = options.prefix ?? "";
 
-  for (const prop of options.property ?? []) {
-    // format: name:type[:description]
-    const parts = prop.split(":");
-    const pName = parts[0];
-    const pType = parts[1] ?? "string";
-    const pDesc = parts.slice(2).join(":");
-    properties[pName] = {
-      type: pType,
-      ...(pDesc ? { description: pDesc } : {}),
-    };
-  }
-
-  const toRef = (r: string): OpenAPISchemaRef => ({
-    $ref: `#/components/schemas/${r}`,
-  });
-
-  const schema: OpenAPISchema = {
-    type: options.type,
-    ...(Object.keys(properties).length > 0 ? { properties } : {}),
-    ...(options.required && options.required.length > 0
-      ? { required: options.required }
-      : {}),
-    ...(options.allOf && options.allOf.length > 0
-      ? { allOf: options.allOf.map(toRef) }
-      : {}),
-    ...(options.oneOf && options.oneOf.length > 0
-      ? { oneOf: options.oneOf.map(toRef) }
-      : {}),
-    ...(options.anyOf && options.anyOf.length > 0
-      ? { anyOf: options.anyOf.map(toRef) }
-      : {}),
-    ...(options.description ? { description: options.description } : {}),
-  };
-
-  spec.components.schemas[name] = schema;
-
-  writeSpec(spec, options.output);
-
-  console.log(
-    chalk.green("✓") +
-      ` Added component ${chalk.bold(name)} (type: ${chalk.cyan(options.type)})`
-  );
-  if (Object.keys(properties).length > 0) {
-    console.log(
-      chalk.dim(`  properties: ${Object.keys(properties).join(", ")}`)
-    );
-  }
-  if (options.required && options.required.length > 0) {
-    console.log(chalk.dim(`  required: ${options.required.join(", ")}`));
-  }
-  const compositions = [
-    ...(options.allOf ?? []).map((r) => `allOf:${r}`),
-    ...(options.oneOf ?? []).map((r) => `oneOf:${r}`),
-    ...(options.anyOf ?? []).map((r) => `anyOf:${r}`),
+  const lines: string[] = [
+    `// Generated by openapi-gen-cli`,
+    `// Source: ${basename(specPath)}`,
+    `// Do not edit manually`,
+    ``,
   ];
-  if (compositions.length > 0) {
-    console.log(chalk.dim(`  composition: ${compositions.join(", ")}`));
+
+  const schemaNames = Object.keys(schemas);
+  if (schemaNames.length === 0) {
+    console.warn(chalk.yellow("No schemas found in components/schemas or definitions"));
   }
+
+  for (const [name, schema] of Object.entries(schemas)) {
+    const typeName = `${prefix}${toPascalCase(name)}`;
+
+    if ("$ref" in schema) {
+      const target = schema.$ref.split("/").pop() ?? "unknown";
+      lines.push(`export type ${typeName} = ${prefix}${toPascalCase(target)};`, ``);
+      continue;
+    }
+
+    const s = schema as SchemaObject;
+
+    if (s.description) {
+      lines.push(`/** ${s.description} */`);
+    }
+
+    if (s.type === "object" || (!s.type && s.properties)) {
+      const required = new Set(s.required ?? []);
+      lines.push(`export interface ${typeName} {`);
+      for (const [propName, propSchema] of Object.entries(s.properties ?? {})) {
+        if ((propSchema as SchemaObject).description) {
+          lines.push(`  /** ${(propSchema as SchemaObject).description} */`);
+        }
+        const opt = required.has(propName) ? "" : "?";
+        lines.push(`  ${propName}${opt}: ${schemaToTs(propSchema, spec, 1)};`);
+      }
+      if (s.additionalProperties && typeof s.additionalProperties !== "boolean") {
+        lines.push(`  [key: string]: ${schemaToTs(s.additionalProperties, spec, 1)};`);
+      }
+      lines.push(`}`, ``);
+    } else if (s.allOf || s.oneOf || s.anyOf || s.enum) {
+      lines.push(`export type ${typeName} = ${schemaToTs(s, spec, 0)};`, ``);
+    } else if (s.type === "string" || s.type === "integer" || s.type === "number" || s.type === "boolean" || s.type === "array") {
+      lines.push(`export type ${typeName} = ${schemaToTs(s, spec, 0)};`, ``);
+    } else {
+      lines.push(`export type ${typeName} = ${schemaToTs(s, spec, 0)};`, ``);
+    }
+  }
+
+  const output = options.output ?? "types.ts";
+  const content = lines.join("\n");
+  writeOutput(content, output);
+  console.log(chalk.dim(`  ${schemaNames.length} types generated`));
+}
+
+// ─── Command: client ──────────────────────────────────────────────────────────
+
+function cmdClient(specPath: string, options: { output?: string; adapter?: string; baseUrl?: string }): void {
+  const spec = loadSpec(specPath);
+  const adapter = (options.adapter ?? "fetch") as "fetch" | "axios";
+  const paths = spec.paths ?? {};
+  const httpMethods = ["get", "post", "put", "patch", "delete", "head", "options"] as const;
+
+  const lines: string[] = [
+    `// Generated by openapi-gen-cli`,
+    `// Source: ${basename(specPath)}`,
+    `// Do not edit manually`,
+    ``,
+  ];
+
+  if (adapter === "axios") {
+    lines.push(`import axios, { AxiosInstance, AxiosResponse } from 'axios';`, ``);
+  }
+
+  // Config interface
+  lines.push(`export interface ClientConfig {`);
+  lines.push(`  baseUrl: string;`);
+  lines.push(`  headers?: Record<string, string>;`);
+  if (adapter === "fetch") {
+    lines.push(`  fetchFn?: typeof fetch;`);
+  }
+  lines.push(`}`, ``);
+
+  // Types for request/response
+  lines.push(`export interface ApiError {`);
+  lines.push(`  status: number;`);
+  lines.push(`  message: string;`);
+  lines.push(`  body?: unknown;`);
+  lines.push(`}`, ``);
+
+  // Client class
+  const title = spec.info?.title ?? "Api";
+  const className = toPascalCase(title.replace(/\s+/g, "")) + "Client";
+
+  lines.push(`export class ${className} {`);
+
+  if (adapter === "axios") {
+    lines.push(`  private readonly http: AxiosInstance;`, ``);
+    lines.push(`  constructor(config: ClientConfig) {`);
+    lines.push(`    this.http = axios.create({`);
+    lines.push(`      baseURL: config.baseUrl,`);
+    lines.push(`      headers: config.headers,`);
+    lines.push(`    });`);
+    lines.push(`  }`, ``);
+  } else {
+    lines.push(`  private readonly baseUrl: string;`);
+    lines.push(`  private readonly headers: Record<string, string>;`);
+    lines.push(`  private readonly fetchFn: typeof fetch;`, ``);
+    lines.push(`  constructor(config: ClientConfig) {`);
+    lines.push(`    this.baseUrl = config.baseUrl.replace(/\\/$/, '');`);
+    lines.push(`    this.headers = config.headers ?? {};`);
+    lines.push(`    this.fetchFn = config.fetchFn ?? fetch;`);
+    lines.push(`  }`, ``);
+
+    // Generic request helper
+    lines.push(`  private async request<T>(method: string, path: string, body?: unknown, params?: Record<string, string>): Promise<T> {`);
+    lines.push(`    const url = new URL(this.baseUrl + path);`);
+    lines.push(`    if (params) {`);
+    lines.push(`      Object.entries(params).forEach(([k, v]) => url.searchParams.set(k, v));`);
+    lines.push(`    }`);
+    lines.push(`    const res = await this.fetchFn(url.toString(), {`);
+    lines.push(`      method,`);
+    lines.push(`      headers: { 'Content-Type': 'application/json', ...this.headers },`);
+    lines.push(`      ...(body !== undefined ? { body: JSON.stringify(body) } : {}),`);
+    lines.push(`    });`);
+    lines.push(`    if (!res.ok) {`);
+    lines.push(`      const errBody = await res.json().catch(() => ({}));`);
+    lines.push(`      const err: ApiError = { status: res.status, message: res.statusText, body: errBody };`);
+    lines.push(`      throw err;`);
+    lines.push(`    }`);
+    lines.push(`    const text = await res.text();`);
+    lines.push(`    return text ? JSON.parse(text) as T : undefined as unknown as T;`);
+    lines.push(`  }`, ``);
+  }
+
+  // Generate methods
+  let methodCount = 0;
+  for (const [pathStr, pathItem] of Object.entries(paths)) {
+    for (const method of httpMethods) {
+      const operation = (pathItem as Record<string, unknown>)[method] as OperationObject | undefined;
+      if (!operation) continue;
+
+      methodCount++;
+      const opId = operation.operationId ?? toCamelCase(`${method}_${pathStr.replace(/[/{}_]/g, "_")}`);
+      const params = operation.parameters ?? [];
+      const pathParams = params.filter((p) => p.in === "path");
+      const queryParams = params.filter((p) => p.in === "query");
+      const hasBody = operation.requestBody && ["post", "put", "patch"].includes(method);
+
+      // Build function args
+      const args: string[] = [];
+      for (const p of pathParams) {
+        args.push(`${p.name}: string`);
+      }
+      if (queryParams.length > 0) {
+        const fields = queryParams.map((p) => {
+          const t = p.schema?.type === "integer" || p.schema?.type === "number" ? "number" : "string";
+          return `${p.name}${p.required ? "" : "?"}: ${t}`;
+        });
+        args.push(`query: { ${fields.join("; ")} }`);
+      }
+      if (hasBody) {
+        args.push(`body: unknown`);
+      }
+
+      // Return type — check 200 response
+      const okResponse = operation.responses?.["200"] ?? operation.responses?.["201"];
+      const returnType = "unknown";
+
+      if (operation.summary) {
+        lines.push(`  /** ${operation.summary} */`);
+      }
+
+      const argsStr = args.join(", ");
+      lines.push(`  async ${toCamelCase(opId)}(${argsStr}): Promise<${returnType}> {`);
+
+      // Build path with substitutions
+      const builtPath = pathStr.replace(/\{([^}]+)\}/g, (_, name) => `\${${name}}`);
+      const pathExpr = pathParams.length > 0 ? "`" + builtPath + "`" : `'${pathStr}'`;
+
+      if (adapter === "fetch") {
+        const queryArg = queryParams.length > 0
+          ? `, Object.fromEntries(Object.entries(query).filter(([,v]) => v !== undefined).map(([k,v]) => [k, String(v)]))`
+          : "";
+        const bodyArg = hasBody ? `, body` : "";
+        lines.push(`    return this.request<${returnType}>('${method.toUpperCase()}', ${pathExpr}${bodyArg}${queryArg});`);
+      } else {
+        const axiosArgs: string[] = [];
+        if (queryParams.length > 0) axiosArgs.push(`params: query`);
+        if (hasBody) axiosArgs.push(`data: body`);
+        const configStr = axiosArgs.length > 0 ? `, { ${axiosArgs.join(", ")} }` : "";
+        const dataMethod = hasBody ? `this.http.${method}<${returnType}>(${pathExpr}, body${configStr})` : `this.http.${method}<${returnType}>(${pathExpr}${configStr})`;
+        lines.push(`    const res: AxiosResponse<${returnType}> = await ${dataMethod};`);
+        lines.push(`    return res.data;`);
+      }
+
+      lines.push(`  }`, ``);
+    }
+  }
+
+  lines.push(`}`);
+
+  // Default export factory
+  lines.push(``, `export function create${className}(config: ClientConfig): ${className} {`);
+  lines.push(`  return new ${className}(config);`);
+  lines.push(`}`);
+
+  const defaultBase = options.baseUrl ?? spec.servers?.[0]?.url ?? "https://api.example.com";
+  lines.push(``, `/** Pre-configured client with default base URL */`);
+  lines.push(`export const defaultClient = new ${className}({ baseUrl: '${defaultBase}' });`);
+
+  const output = options.output ?? "client.ts";
+  writeOutput(lines.join("\n"), output);
+  console.log(chalk.dim(`  ${methodCount} API methods generated (adapter: ${adapter})`));
+}
+
+// ─── Command: server ──────────────────────────────────────────────────────────
+
+function cmdServer(specPath: string, options: { output?: string; framework?: string }): void {
+  const spec = loadSpec(specPath);
+  const framework = (options.framework ?? "express") as "express" | "fastify";
+  const paths = spec.paths ?? {};
+  const httpMethods = ["get", "post", "put", "patch", "delete"] as const;
+
+  const lines: string[] = [
+    `// Generated by openapi-gen-cli`,
+    `// Source: ${basename(specPath)}`,
+    `// Do not edit manually`,
+    ``,
+  ];
+
+  if (framework === "express") {
+    lines.push(`import { Router, Request, Response, NextFunction } from 'express';`, ``);
+    lines.push(`const router = Router();`, ``);
+  } else {
+    lines.push(`import { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';`, ``);
+  }
+
+  // Handler type
+  if (framework === "express") {
+    lines.push(`type Handler = (req: Request, res: Response, next: NextFunction) => void | Promise<void>;`, ``);
+  } else {
+    lines.push(`type Handler = (req: FastifyRequest, reply: FastifyReply) => void | Promise<void>;`, ``);
+  }
+
+  // Route handlers
+  let routeCount = 0;
+  const routeLines: string[] = [];
+
+  for (const [pathStr, pathItem] of Object.entries(paths)) {
+    for (const method of httpMethods) {
+      const operation = (pathItem as Record<string, unknown>)[method] as OperationObject | undefined;
+      if (!operation) continue;
+
+      routeCount++;
+      const opId = operation.operationId ?? toCamelCase(`${method}_${pathStr.replace(/[/{}_]/g, "_")}`);
+      const handlerName = `${toCamelCase(opId)}Handler`;
+
+      // Convert OpenAPI path params {id} to Express :id or Fastify :id
+      const frameworkPath = pathStr.replace(/\{([^}]+)\}/g, ":$1");
+
+      lines.push(`/**`);
+      if (operation.summary) lines.push(` * ${operation.summary}`);
+      lines.push(` * ${method.toUpperCase()} ${pathStr}`);
+      lines.push(` */`);
+
+      if (framework === "express") {
+        lines.push(`export const ${handlerName}: Handler = async (req, res) => {`);
+        lines.push(`  // TODO: implement ${opId}`);
+        lines.push(`  res.status(200).json({ message: 'Not implemented' });`);
+        lines.push(`};`, ``);
+        routeLines.push(`router.${method}('${frameworkPath}', ${handlerName});`);
+      } else {
+        lines.push(`export const ${handlerName}: Handler = async (req, reply) => {`);
+        lines.push(`  // TODO: implement ${opId}`);
+        lines.push(`  reply.code(200).send({ message: 'Not implemented' });`);
+        lines.push(`};`, ``);
+        routeLines.push(`  fastify.${method}('${frameworkPath}', ${handlerName});`);
+      }
+    }
+  }
+
+  if (framework === "express") {
+    lines.push(`// ─── Route registration ──────────────────────────────────────────────────────`);
+    lines.push(...routeLines);
+    lines.push(``);
+    lines.push(`export { router };`);
+  } else {
+    lines.push(`// ─── Plugin registration ──────────────────────────────────────────────────────`);
+    lines.push(`export async function registerRoutes(fastify: FastifyInstance): Promise<void> {`);
+    lines.push(...routeLines);
+    lines.push(`}`);
+  }
+
+  const output = options.output ?? "server.ts";
+  writeOutput(lines.join("\n"), output);
+  console.log(chalk.dim(`  ${routeCount} route handlers generated (framework: ${framework})`));
+}
+
+// ─── Command: validate ────────────────────────────────────────────────────────
+
+interface ValidationIssue {
+  severity: "error" | "warning";
+  path: string;
+  message: string;
+}
+
+function cmdValidate(specPath: string, options: { strict?: boolean }): void {
+  const spec = loadSpec(specPath);
+  const issues: ValidationIssue[] = [];
+
+  const add = (severity: "error" | "warning", path: string, message: string) => {
+    issues.push({ severity, path, message });
+  };
+
+  // 1. Basic structure
+  if (!spec.openapi && !spec.swagger) {
+    add("error", "root", "Missing `openapi` or `swagger` version field");
+  }
+  if (!spec.info?.title) add("error", "info.title", "Missing info.title");
+  if (!spec.info?.version) add("error", "info.version", "Missing info.version");
+
+  // 2. Paths validation
+  const paths = spec.paths ?? {};
+  for (const [pathStr, pathItem] of Object.entries(paths)) {
+    if (!pathStr.startsWith("/")) {
+      add("error", `paths.${pathStr}`, `Path must start with "/"`);
+    }
+
+    const httpMethods = ["get", "post", "put", "patch", "delete", "head", "options"];
+    for (const method of httpMethods) {
+      const operation = (pathItem as Record<string, unknown>)[method] as OperationObject | undefined;
+      if (!operation) continue;
+
+      const opPath = `paths.${pathStr}.${method}`;
+
+      if (!operation.operationId) {
+        add("warning", opPath, "Missing operationId");
+      }
+
+      if (!operation.responses || Object.keys(operation.responses).length === 0) {
+        add("error", opPath, "Operation has no responses defined");
+      }
+
+      // Check path params match
+      const pathParamsInPath = [...pathStr.matchAll(/\{([^}]+)\}/g)].map((m) => m[1]);
+      const pathParamsInOp = (operation.parameters ?? [])
+        .filter((p) => p.in === "path")
+        .map((p) => p.name);
+
+      for (const p of pathParamsInPath) {
+        if (!pathParamsInOp.includes(p)) {
+          add("error", `${opPath}.parameters`, `Path param {${p}} not defined in parameters`);
+        }
+      }
+
+      if (options.strict) {
+        if (!operation.summary) add("warning", opPath, "Missing summary");
+        if (!operation.tags || operation.tags.length === 0) {
+          add("warning", opPath, "No tags assigned to operation");
+        }
+      }
+    }
+  }
+
+  // 3. Schema validation & circular reference detection
+  const schemas = getSchemas(spec);
+  const allRefNames = new Set<string>();
+
+  function collectRefs(schema: SchemaObject | RefObject | undefined, visited = new Set<string>()): void {
+    if (!schema) return;
+    if ("$ref" in schema) {
+      const name = schema.$ref.split("/").pop() ?? "";
+      allRefNames.add(name);
+      if (visited.has(name)) {
+        add("error", `components.schemas.${name}`, `Circular reference detected: ${[...visited, name].join(" → ")}`);
+        return;
+      }
+      const resolved = resolveRef(schema.$ref, spec);
+      if (resolved) {
+        collectRefs(resolved, new Set([...visited, name]));
+      } else {
+        add("error", `components.schemas`, `Unresolvable $ref: ${schema.$ref}`);
+      }
+      return;
+    }
+    const s = schema as SchemaObject;
+    if (s.properties) Object.values(s.properties).forEach((p) => collectRefs(p, visited));
+    if (s.items) collectRefs(s.items, visited);
+    if (s.allOf) s.allOf.forEach((v) => collectRefs(v, visited));
+    if (s.oneOf) s.oneOf.forEach((v) => collectRefs(v, visited));
+    if (s.anyOf) s.anyOf.forEach((v) => collectRefs(v, visited));
+    if (s.additionalProperties && typeof s.additionalProperties !== "boolean") {
+      collectRefs(s.additionalProperties, visited);
+    }
+  }
+
+  // Collect all refs from paths
+  for (const pathItem of Object.values(paths)) {
+    for (const method of ["get", "post", "put", "patch", "delete"]) {
+      const op = (pathItem as Record<string, unknown>)[method] as OperationObject | undefined;
+      if (!op) continue;
+      if (op.requestBody?.content) {
+        for (const media of Object.values(op.requestBody.content)) {
+          if (media.schema) collectRefs(media.schema as SchemaObject, new Set());
+        }
+      }
+      for (const resp of Object.values(op.responses ?? {})) {
+        if (resp.content) {
+          for (const media of Object.values(resp.content)) {
+            if (media.schema) collectRefs(media.schema as SchemaObject, new Set());
+          }
+        }
+      }
+    }
+  }
+
+  // Check for schemas defined but never referenced
+  if (options.strict) {
+    for (const name of Object.keys(schemas)) {
+      if (!allRefNames.has(name)) {
+        add("warning", `components.schemas.${name}`, `Schema "${name}" is defined but never referenced`);
+      }
+    }
+  }
+
+  // ─── Report ───────────────────────────────────────────────────────────────
+  const errors = issues.filter((i) => i.severity === "error");
+  const warnings = issues.filter((i) => i.severity === "warning");
+
+  if (issues.length === 0) {
+    console.log(chalk.green("✓") + " Spec is valid — no issues found");
+    return;
+  }
+
+  for (const issue of errors) {
+    console.log(chalk.red("✗ [error]") + chalk.dim(` ${issue.path}`) + ` — ${issue.message}`);
+  }
+  for (const issue of warnings) {
+    console.log(chalk.yellow("⚠ [warn] ") + chalk.dim(` ${issue.path}`) + ` — ${issue.message}`);
+  }
+
+  console.log(
+    `\n${errors.length > 0 ? chalk.red(`${errors.length} error(s)`) : chalk.green("0 errors")}` +
+    `, ${warnings.length > 0 ? chalk.yellow(`${warnings.length} warning(s)`) : chalk.green("0 warnings")}`
+  );
+
+  if (errors.length > 0) process.exit(1);
+}
+
+// ─── Command: diff ────────────────────────────────────────────────────────────
+
+interface DiffChange {
+  type: "breaking" | "non-breaking";
+  description: string;
+}
+
+function cmdDiff(oldSpecPath: string, newSpecPath: string, options: { format?: string }): void {
+  const oldSpec = loadSpec(oldSpecPath);
+  const newSpec = loadSpec(newSpecPath);
+  const changes: DiffChange[] = [];
+
+  const add = (type: "breaking" | "non-breaking", description: string) => {
+    changes.push({ type, description });
+  };
+
+  // Info changes
+  if (oldSpec.info?.version !== newSpec.info?.version) {
+    add("non-breaking", `Version changed: ${oldSpec.info?.version} → ${newSpec.info?.version}`);
+  }
+
+  // Servers
+  const oldServers = new Set((oldSpec.servers ?? []).map((s) => s.url));
+  const newServers = new Set((newSpec.servers ?? []).map((s) => s.url));
+  for (const url of oldServers) {
+    if (!newServers.has(url)) add("breaking", `Server removed: ${url}`);
+  }
+  for (const url of newServers) {
+    if (!oldServers.has(url)) add("non-breaking", `Server added: ${url}`);
+  }
+
+  // Paths
+  const oldPaths = oldSpec.paths ?? {};
+  const newPaths = newSpec.paths ?? {};
+  const httpMethods = ["get", "post", "put", "patch", "delete", "head", "options"] as const;
+
+  for (const [pathStr, oldItem] of Object.entries(oldPaths)) {
+    if (!(pathStr in newPaths)) {
+      add("breaking", `Path removed: ${pathStr}`);
+      continue;
+    }
+    const newItem = newPaths[pathStr];
+
+    for (const method of httpMethods) {
+      const oldOp = (oldItem as Record<string, unknown>)[method] as OperationObject | undefined;
+      const newOp = (newItem as Record<string, unknown>)[method] as OperationObject | undefined;
+
+      if (oldOp && !newOp) {
+        add("breaking", `Operation removed: ${method.toUpperCase()} ${pathStr}`);
+        continue;
+      }
+      if (!oldOp && newOp) {
+        add("non-breaking", `Operation added: ${method.toUpperCase()} ${pathStr}`);
+        continue;
+      }
+      if (!oldOp || !newOp) continue;
+
+      const opKey = `${method.toUpperCase()} ${pathStr}`;
+
+      // Required params removed/added
+      const oldRequired = new Set((oldOp.parameters ?? []).filter((p) => p.required).map((p) => `${p.in}:${p.name}`));
+      const newRequired = new Set((newOp.parameters ?? []).filter((p) => p.required).map((p) => `${p.in}:${p.name}`));
+      for (const p of oldRequired) {
+        if (!newRequired.has(p)) add("breaking", `${opKey}: Required param removed: ${p}`);
+      }
+      for (const p of newRequired) {
+        if (!oldRequired.has(p)) add("breaking", `${opKey}: New required param added: ${p}`);
+      }
+
+      // All params removed
+      const oldParams = new Set((oldOp.parameters ?? []).map((p) => `${p.in}:${p.name}`));
+      const newParams = new Set((newOp.parameters ?? []).map((p) => `${p.in}:${p.name}`));
+      for (const p of oldParams) {
+        if (!newParams.has(p)) add("non-breaking", `${opKey}: Param removed: ${p}`);
+      }
+      for (const p of newParams) {
+        if (!oldParams.has(p)) add("non-breaking", `${opKey}: Param added: ${p}`);
+      }
+
+      // Response codes removed
+      const oldCodes = new Set(Object.keys(oldOp.responses ?? {}));
+      const newCodes = new Set(Object.keys(newOp.responses ?? {}));
+      for (const code of oldCodes) {
+        if (!newCodes.has(code)) add("non-breaking", `${opKey}: Response ${code} removed`);
+      }
+
+      // RequestBody required change
+      if (oldOp.requestBody?.required === false && newOp.requestBody?.required === true) {
+        add("breaking", `${opKey}: requestBody changed from optional to required`);
+      }
+      if (oldOp.requestBody && !newOp.requestBody) {
+        add("breaking", `${opKey}: requestBody removed`);
+      }
+
+      // OperationId change
+      if (oldOp.operationId && newOp.operationId && oldOp.operationId !== newOp.operationId) {
+        add("breaking", `${opKey}: operationId changed: ${oldOp.operationId} → ${newOp.operationId}`);
+      }
+    }
+  }
+
+  for (const pathStr of Object.keys(newPaths)) {
+    if (!(pathStr in oldPaths)) {
+      add("non-breaking", `Path added: ${pathStr}`);
+    }
+  }
+
+  // Schema changes
+  const oldSchemas = getSchemas(oldSpec);
+  const newSchemas = getSchemas(newSpec);
+  for (const name of Object.keys(oldSchemas)) {
+    if (!(name in newSchemas)) add("breaking", `Schema removed: ${name}`);
+  }
+  for (const name of Object.keys(newSchemas)) {
+    if (!(name in oldSchemas)) add("non-breaking", `Schema added: ${name}`);
+  }
+
+  // ─── Report ───────────────────────────────────────────────────────────────
+  if (changes.length === 0) {
+    console.log(chalk.green("✓") + " No differences detected between specs");
+    return;
+  }
+
+  const breaking = changes.filter((c) => c.type === "breaking");
+  const nonBreaking = changes.filter((c) => c.type !== "breaking");
+
+  if (options.format === "json") {
+    console.log(JSON.stringify({ breaking, nonBreaking }, null, 2));
+    return;
+  }
+
+  if (breaking.length > 0) {
+    console.log(chalk.red.bold(`\nBreaking changes (${breaking.length}):`));
+    for (const c of breaking) {
+      console.log(chalk.red("  ✗ ") + c.description);
+    }
+  }
+  if (nonBreaking.length > 0) {
+    console.log(chalk.yellow.bold(`\nNon-breaking changes (${nonBreaking.length}):`));
+    for (const c of nonBreaking) {
+      console.log(chalk.yellow("  ~ ") + c.description);
+    }
+  }
+
+  console.log(
+    `\n${breaking.length > 0 ? chalk.red(`${breaking.length} breaking`) : chalk.green("0 breaking")}` +
+    `, ${chalk.yellow(`${nonBreaking.length} non-breaking`)}`
+  );
+
+  if (breaking.length > 0) process.exit(1);
 }
 
 // ─── CLI setup ────────────────────────────────────────────────────────────────
@@ -476,76 +977,41 @@ const program = new Command();
 
 program
   .name("openapi-gen")
-  .description("Generate and manage OpenAPI 3.0 specifications")
+  .description("Generate TypeScript clients, server stubs, and types from OpenAPI specs")
   .version("1.0.0");
 
-// ── init ──────────────────────────────────────────────────────────────────────
 program
-  .command("init")
-  .description("Create an OpenAPI 3.0 YAML template")
-  .option("-o, --output <file>", "Output filename", DEFAULT_FILE)
-  .option("-t, --title <title>", "API title", "My API")
-  .option("-v, --api-version <version>", "API version", "1.0.0")
-  .option("-s, --server <url>", "Server URL", "https://api.example.com/v1")
-  .action((opts) => cmdInit(opts));
+  .command("types <spec>")
+  .description("Generate TypeScript interfaces from OpenAPI schema components")
+  .option("-o, --output <file>", "Output file path", "types.ts")
+  .option("--prefix <prefix>", "Prefix all generated type names", "")
+  .action((spec: string, opts) => cmdTypes(spec, opts));
 
-// ── endpoint ──────────────────────────────────────────────────────────────────
 program
-  .command("endpoint <method> <path>")
-  .description("Add an endpoint to the spec")
-  .option("-o, --output <file>", "Spec filename", DEFAULT_FILE)
-  .option("--tag <tag>", "Tag for the endpoint", "default")
-  .option("--operation-id <id>", "Custom operationId")
-  .option("--summary <summary>", "Short summary")
-  .option(
-    "--param <name:type>",
-    "Add a query parameter (repeatable, e.g. --param page:integer)",
-    (v: string, prev: string[]) => [...prev, v],
-    [] as string[]
-  )
-  .option("--no-body", "Skip requestBody (even for POST/PUT/PATCH)")
-  .option("--body-schema <name>", "Reference an existing schema for requestBody")
-  .action((method: string, path: string, opts) =>
-    cmdEndpoint(method, path, opts)
-  );
+  .command("client <spec>")
+  .description("Generate a typed HTTP client from spec endpoints")
+  .option("-o, --output <file>", "Output file path", "client.ts")
+  .option("--adapter <adapter>", "HTTP adapter to use: fetch or axios", "fetch")
+  .option("--base-url <url>", "Override default base URL from spec")
+  .action((spec: string, opts) => cmdClient(spec, opts));
 
-// ── component ─────────────────────────────────────────────────────────────────
 program
-  .command("component <name>")
-  .description("Add a schema component to components/schemas")
-  .option("-o, --output <file>", "Spec filename", DEFAULT_FILE)
-  .option("--type <type>", "Schema type (object, string, integer, …)", "object")
-  .option(
-    "--property <name:type[:desc]>",
-    "Add a property (repeatable)",
-    (v: string, prev: string[]) => [...prev, v],
-    [] as string[]
-  )
-  .option(
-    "--required <name>",
-    "Mark a property as required (repeatable)",
-    (v: string, prev: string[]) => [...prev, v],
-    [] as string[]
-  )
-  .option(
-    "--all-of <schema>",
-    "Add allOf reference (repeatable)",
-    (v: string, prev: string[]) => [...prev, v],
-    [] as string[]
-  )
-  .option(
-    "--one-of <schema>",
-    "Add oneOf reference (repeatable)",
-    (v: string, prev: string[]) => [...prev, v],
-    [] as string[]
-  )
-  .option(
-    "--any-of <schema>",
-    "Add anyOf reference (repeatable)",
-    (v: string, prev: string[]) => [...prev, v],
-    [] as string[]
-  )
-  .option("--description <text>", "Schema description")
-  .action((name: string, opts) => cmdComponent(name, opts));
+  .command("server <spec>")
+  .description("Generate Express/Fastify route handlers from spec")
+  .option("-o, --output <file>", "Output file path", "server.ts")
+  .option("--framework <framework>", "Server framework: express or fastify", "express")
+  .action((spec: string, opts) => cmdServer(spec, opts));
+
+program
+  .command("validate <spec>")
+  .description("Deep validation with semantic checks (circular refs, unused schemas)")
+  .option("--strict", "Enable strict checks (missing summaries, unused schemas)", false)
+  .action((spec: string, opts) => cmdValidate(spec, opts));
+
+program
+  .command("diff <old> <new>")
+  .description("Compare two specs and report breaking/non-breaking changes")
+  .option("--format <format>", "Output format: text or json", "text")
+  .action((oldSpec: string, newSpec: string, opts) => cmdDiff(oldSpec, newSpec, opts));
 
 program.parse(process.argv);
